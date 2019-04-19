@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterator, Sequence, Text, Union
-
+from collections import deque
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_extraction import DictVectorizer
 
 @dataclass()
 class Dep:
@@ -38,6 +41,27 @@ def read_conllu(path: Text) -> Iterator[Sequence[Dep]]:
     words, and each word is represented by a Dep object.
     """
 
+    sentence = []
+    with open(path) as infile:
+        for line in infile:
+            if line[0] == "#":
+                continue
+            line = line.strip()
+            if not line:
+                yield sentence
+                sentence = []
+                continue
+            line = line.split("\t")
+            for i, item in enumerate(line):
+                if i == 5 or i == 8:
+                    if item == "_":
+                        line[i] = []
+                    else:
+                        line[i] = item.split("|")
+                elif item == "_":
+                    line[i] = None 
+            word = Dep(*line)
+            sentence.append(word)
 
 class Action(Enum):
     """An action in an "arc standard" transition-based parser."""
@@ -73,6 +97,30 @@ def parse(deps: Sequence[Dep],
     current stack and queue as input, and returns an "arc standard" action.
     :return: Nothing; the `.head` fields of the input Dep objects are modified.
     """
+    queue = deque(deps)
+    stack = list()
+
+    for word in list(queue):
+        if "." in word.id:
+            queue.remove(word)
+
+    while queue or len(stack) > 1:
+
+        action = get_action(stack, queue)
+
+        if (action.value == 1 and queue) or len(stack) < 2 :
+            dep = queue.popleft()
+            stack.append(dep)
+        elif action.value == 2:
+            stack[-2].head = stack[-1].id
+            stack.pop(-2)
+        else:
+            stack[-1].head = stack[-2].id
+            stack.pop()
+      
+    for dep in deps:
+        if dep.head == None:
+            dep.head = "0"
 
 
 class Oracle:
@@ -89,6 +137,8 @@ class Oracle:
         :param deps: The sentence, a sequence of Dep objects, each representing
         one of the words in the sentence.
         """
+        self.actions = []
+        self.features = []
 
     def __call__(self, stack: Sequence[Dep], queue: Sequence[Dep]) -> Action:
         """Returns the Oracle action for the given "arc standard" parser state.
@@ -116,8 +166,37 @@ class Oracle:
         :return: The action that should be taken given the reference parse
         (the `.head` fields of the Dep objects).
         """
+        #Feature Extraction
+        word_range = 2
+        re_stack = reversed(stack)
+        stack_pos = ["sPOS{}=".format(i) + dep.upos for i, dep in enumerate(re_stack) if i < word_range]
+        queue_pos = ["qPOS{}=".format(i) + dep.upos for i, dep in enumerate(queue) if i < word_range]
+        stack_form = ["sform{}=".format(i) + dep.form for i, dep in enumerate(re_stack) if i < word_range and dep.form]
+        queue_form = ["qform{}=".format(i) + dep.form for i, dep in enumerate(queue) if i < word_range and dep.form]
 
+        feature_list = stack_pos + queue_pos + stack_form + queue_form
+        dict_f = {feature:1 for feature in feature_list}
+        self.features.append(dict_f)
 
+        if len(stack) < 2 and queue:
+            self.actions.append(Action.SHIFT)
+            return Action.SHIFT
+
+        previous_head = [x.head for x in stack[:-1]]
+        rest_head = [y.head for y in queue]
+
+        if stack[-1].id in previous_head:
+            self.actions.append(Action.LEFT_ARC)
+            return Action.LEFT_ARC
+
+        elif (int(stack[-1].head) < int(stack[-1].id)) and (stack[-1].id not in rest_head):
+            self.actions.append(Action.RIGHT_ARC)
+            return Action.RIGHT_ARC
+
+        else:
+            self.actions.append(Action.SHIFT)
+            return Action.SHIFT 
+    
 class Classifier:
     def __init__(self, parses: Iterator[Sequence[Dep]]):
         """Trains a classifier on the given parses.
@@ -138,6 +217,25 @@ class Classifier:
         :param parses: An iterator over sentences, where each sentence is a
         sequence of words, and each word is represented by a Dep object.
         """
+        self.lg = LogisticRegression(multi_class = "multinomial", solver = "lbfgs", penalty = "l2", C = 0.1, max_iter = 300)
+        self.dv = DictVectorizer()
+        self.le = LabelEncoder()
+        whole_feature = []
+        whole_label = []
+        for deps in parses:
+            oracle = Oracle(deps)
+            parse(deps, oracle)
+            whole_feature += oracle.features
+            whole_label += [action.value for action in oracle.actions]
+        
+        self.dv.fit(whole_feature)
+        self.le.fit(whole_label)
+
+        feature_matrix = self.dv.transform(whole_feature)
+        label = self.le.transform(whole_label)
+
+        self.lg.fit(feature_matrix, label)
+        
 
     def __call__(self, stack: Sequence[Dep], queue: Sequence[Dep]) -> Action:
         """Predicts an action for the given "arc standard" parser state.
@@ -151,4 +249,25 @@ class Classifier:
         :param queue: The queue of the "arc standard" transition-based parser.
         :return: The action that should be taken.
         """
+        word_range = 2
+        re_stack = reversed(stack)
+        stack_pos = ["sPOS{}=".format(i) + dep.upos for i, dep in enumerate(re_stack) if i < word_range]
+        queue_pos = ["qPOS{}=".format(i) + dep.upos for i, dep in enumerate(queue) if i < word_range]
+        stack_form = ["sform{}=".format(i) + dep.form for i, dep in enumerate(re_stack) if i < word_range and dep.form]
+        queue_form = ["qform{}=".format(i) + dep.form for i, dep in enumerate(queue) if i < word_range and dep.form]
 
+        feature_list = stack_pos + queue_pos + stack_form + queue_form
+
+        dict_f = {feature:1 for feature in feature_list}
+
+        feature_matrix = self.dv.transform(dict_f)
+        
+        label = self.lg.predict(feature_matrix)
+        action = self.le.inverse_transform(label)[0]
+        
+        if action == 1:
+            return Action.SHIFT
+        elif action == 2:
+            return Action.LEFT_ARC
+        else:
+            return Action.RIGHT_ARC
